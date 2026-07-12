@@ -99,3 +99,21 @@ async def test_white_only_light_still_dances():
     assert len(white) > 5
     assert all("color_xy" not in c.kwargs for c in white[-3:])
     assert any("brightness" in c.kwargs for c in white)
+
+
+async def test_sigterm_restores_lights():
+    """A stop command must not leave the room frozen mid-strobe."""
+    ids = ["l1", "l2"]
+    bridge = _make_bridge(ids)
+
+    task = asyncio.create_task(birthday(bridge, ids, duration=3600.0))
+    await asyncio.sleep(1.0)
+
+    # This is what the signal handler in interfaces/cli.py does
+    task.cancel()
+    await task
+
+    for lid in ids:
+        last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
+        assert last.kwargs["on"] is True
+        assert last.kwargs["brightness"] == 42.0

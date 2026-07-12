@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
+from contextlib import suppress
 
 from loguru import logger
 
@@ -40,7 +42,18 @@ async def run_dance(name: str, duration: float, rooms: list[str]) -> int:
             return 1
 
         logger.info("running '{}' on {} lights for {:.0f}s", name, len(light_ids), duration)
-        await REGISTRY[name](b.raw, light_ids, duration=duration)
+        task = asyncio.create_task(REGISTRY[name](b.raw, light_ids, duration=duration))
+
+        # A scheduler or a "stop" command kills us with SIGTERM. Cancel the dance
+        # rather than dying where we stand, so its cleanup restores the lights
+        # instead of leaving the room frozen mid-strobe.
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with suppress(NotImplementedError):
+                loop.add_signal_handler(sig, task.cancel)
+
+        with suppress(asyncio.CancelledError):
+            await task
         logger.info("done")
     return 0
 
