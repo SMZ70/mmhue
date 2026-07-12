@@ -36,6 +36,7 @@ _DANCE_ICON: dict[str, str] = {
     "ambulance":       "🚑",
     "thunderstorm":    "⛈",
     "bandari":         "🎶",
+    "birthday":        "🎂",
 }
 
 _BRI_STEPS   = [20, 40, 60, 80, 100]

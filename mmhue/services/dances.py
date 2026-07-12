@@ -532,6 +532,233 @@ async def bandari(
 
 
 # ---------------------------------------------------------------------------
+# Dance 5 — Birthday  (candles → wish → blow-out → confetti party)
+# ---------------------------------------------------------------------------
+
+# Saturated party palette — balloons, confetti, streamers
+_PARTY_HUES: tuple[float, ...] = (0, 30, 55, 100, 190, 225, 275, 300, 330)
+
+_CANDLE_HUE = (18.0, 45.0)  # deep amber → gold
+
+
+async def birthday(
+    bridge: HueBridgeV2,
+    light_ids: list[str],
+    *,
+    duration: float = 90.0,
+) -> None:
+    """A birthday told in acts, then a party that never repeats itself.
+
+    Opening (plays once):
+      candles   — warm amber flicker, dim and intimate, a lit cake
+      wish      — the room sinks away until one "cake" light is left glowing
+      blow-out  — the cake light puffs bright, snaps dark, and a beat of silence
+      pop       — confetti cannon: every light bursts a random party colour
+
+    Party (shuffled, drawn without replacement, ~6–11 s each until time runs out):
+      confetti     — rapid random-colour pops on random lights, 8 fps
+      rainbow_spin — the hue wheel chasing around the room
+      sparklers    — white-hot twinkles over a deep coloured bed
+      cheer        — full-room strobe alternating two party colours
+
+    Energy climbs over the first half of the dance: brighter, faster, deeper
+    strobes, more lights popping per frame.
+    """
+    if not light_ids:
+        logger.warning("birthday: no lights to dance with")
+        return
+
+    saved = await _capture_state(bridge, light_ids)
+    dead: set[str] = set()
+    n = len(light_ids)
+    started = asyncio.get_event_loop().time()
+
+    def _elapsed() -> float:
+        return asyncio.get_event_loop().time() - started
+
+    def _energy() -> float:
+        """0 → 1 over the first half of the dance."""
+        return min(1.0, _elapsed() / max(duration * 0.5, 1.0))
+
+    def _party_xy() -> tuple[float, float]:
+        return _hue_to_xy(random.choice(_PARTY_HUES) + random.uniform(-8, 8))
+
+    async def _pace(t0: float, interval: float) -> None:
+        await asyncio.sleep(max(0.0, interval - (asyncio.get_event_loop().time() - t0)))
+
+    # ── Opening acts ─────────────────────────────────────────────────────────
+
+    async def candles(secs: float) -> None:
+        interval = 1 / 5
+        phase = {lid: random.uniform(0, 2 * math.pi) for lid in light_ids}
+        freq = {lid: random.uniform(0.8, 1.9) for lid in light_ids}
+
+        for lid in light_ids:
+            await _set(bridge, lid, dead, on=True, brightness=22, transition_time=1200,
+                       color_xy=_hue_to_xy(random.uniform(*_CANDLE_HUE)))
+        await asyncio.sleep(1.3)
+
+        t = 0.0
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            for lid in light_ids:
+                flicker = 0.5 + 0.5 * math.sin(2 * math.pi * freq[lid] * t + phase[lid])
+                bri = 12 + 16 * flicker + random.uniform(-3.0, 3.0)
+                await _set(bridge, lid, dead, color_xy=_hue_to_xy(random.uniform(*_CANDLE_HUE)),
+                           brightness=max(4.0, bri), transition_time=int(interval * 900))
+            t += interval
+            await _pace(t0, interval)
+
+    async def wish(secs: float) -> str:
+        """Everything fades away except one light — the cake, waiting."""
+        cake = random.choice(light_ids)
+        for lid in light_ids:
+            if lid == cake:
+                await _set(bridge, lid, dead, color_xy=_hue_to_xy(38), brightness=55,
+                           transition_time=1400)
+            else:
+                await _set(bridge, lid, dead, brightness=2, transition_time=1600)
+        await asyncio.sleep(1.8)
+
+        interval = 1 / 5
+        t = 1.8
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            bri = 48 + 10 * math.sin(2 * math.pi * 1.4 * t) + random.uniform(-4.0, 4.0)
+            await _set(bridge, cake, dead, color_xy=_hue_to_xy(random.uniform(*_CANDLE_HUE)),
+                       brightness=max(20.0, bri), transition_time=int(interval * 900))
+            t += interval
+            await _pace(t0, interval)
+        return cake
+
+    async def blow_out(cake: str) -> None:
+        """One last flare, then out — and let the darkness land."""
+        await _set(bridge, cake, dead, color_xy=_hue_to_xy(45), brightness=85, transition_time=90)
+        await asyncio.sleep(0.22)
+        for lid in light_ids:
+            await _set(bridge, lid, dead, brightness=1, transition_time=260)
+        await asyncio.sleep(1.1)
+
+    async def pop() -> None:
+        """Confetti cannon — the whole room detonates at once."""
+        logger.debug("birthday: 🎉 pop")
+        for lid in light_ids:
+            await _set(bridge, lid, dead, on=True, color_xy=_party_xy(),
+                       brightness=100, transition_time=60)
+        await asyncio.sleep(0.5)
+        for _ in range(2):  # double-flash the cannon
+            for lid in light_ids:
+                await _set(bridge, lid, dead, brightness=25, transition_time=70)
+            await asyncio.sleep(0.12)
+            for lid in light_ids:
+                await _set(bridge, lid, dead, color_xy=_party_xy(), brightness=100,
+                           transition_time=70)
+            await asyncio.sleep(0.16)
+
+    # ── Party acts ───────────────────────────────────────────────────────────
+
+    async def confetti(secs: float) -> None:
+        """Only a handful of lights change each frame — snappy, never in sync."""
+        interval = 1 / 8
+        t = 0.0
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            hits = min(n, 1 + int(round(random.uniform(0, 1.6 + 1.4 * _energy()))))
+            for lid in random.sample(light_ids, hits):
+                await _set(bridge, lid, dead, color_xy=_party_xy(),
+                           brightness=random.uniform(55, 100), transition_time=70)
+            t += interval
+            await _pace(t0, interval)
+
+    async def rainbow_spin(secs: float) -> None:
+        """A hue wheel chasing around the room, faster as the party heats up."""
+        interval = 1 / 6
+        spread = 360.0 / n
+        base = random.uniform(0, 360)
+        t = 0.0
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            base = (base + (110 + 150 * _energy()) * interval) % 360
+            for i, lid in enumerate(light_ids):
+                await _set(bridge, lid, dead, color_xy=_hue_to_xy((base + i * spread) % 360),
+                           brightness=70 + 25 * _energy(), transition_time=int(interval * 850))
+            t += interval
+            await _pace(t0, interval)
+
+    async def sparklers(secs: float) -> None:
+        """Deep coloured bed, white-hot twinkles skittering across it."""
+        bed = _hue_to_xy(random.choice([275, 300, 225]))
+        for lid in light_ids:
+            await _set(bridge, lid, dead, color_xy=bed, brightness=30, transition_time=500)
+        await asyncio.sleep(0.6)
+
+        interval = 1 / 8
+        t = 0.0
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            for lid in random.sample(light_ids, min(n, random.randint(1, 2))):
+                await _set(bridge, lid, dead, color_xy=_WHITE_XY, brightness=100,
+                           transition_time=40)
+            for lid in random.sample(light_ids, min(n, random.randint(1, 2))):
+                await _set(bridge, lid, dead, color_xy=bed, brightness=random.uniform(20, 38),
+                           transition_time=200)
+            t += interval
+            await _pace(t0, interval)
+
+    async def cheer(secs: float) -> None:
+        """Full-room strobe — two colours, hard alternation, everyone together."""
+        hz = 4.0 + 2.0 * _energy()
+        half = 1.0 / (hz * 2)
+        a, b = _party_xy(), _party_xy()
+        t = 0.0
+        phase = 0
+        while t < secs:
+            t0 = asyncio.get_event_loop().time()
+            xy = a if phase % 2 == 0 else b
+            bri = 100 if phase % 2 == 0 else 45 + 25 * _energy()
+            for lid in light_ids:
+                await _set(bridge, lid, dead, color_xy=xy, brightness=bri,
+                           transition_time=max(30, int(half * 160)))
+            phase += 1
+            t += half
+            await _pace(t0, half)
+
+    # ── Run the show ─────────────────────────────────────────────────────────
+
+    try:
+        logger.info("birthday  {} lights  {:.0f}s", n, duration)
+
+        scale = min(1.0, duration / 45.0)  # keep the opening in proportion
+        await candles(max(3.0, 10.0 * scale))
+        cake = await wish(max(2.0, 4.0 * scale))
+        await blow_out(cake)
+        await pop()
+
+        party = [confetti, rainbow_spin, sparklers, cheer]
+        bag: list[Callable[[float], Awaitable[None]]] = []
+
+        while True:
+            remaining = duration - _elapsed()
+            if remaining <= 0.5:
+                break
+            if not bag:
+                bag = party.copy()
+                random.shuffle(bag)
+            act = bag.pop()
+            secs = min(remaining, random.uniform(6.0, 11.0))
+            logger.debug("birthday act → {}  {:.0f}s  energy {:.2f}",
+                         act.__name__, secs, _energy())
+            await act(secs)
+
+        logger.info("birthday finished")
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        await _restore_state(bridge, saved)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -543,4 +770,5 @@ REGISTRY: dict[str, DanceFn] = {
     "ambulance":       lambda b, ids, **kw: emergency_flash(b, ids, mode="ambulance", **kw),
     "thunderstorm":    thunderstorm,
     "bandari":         bandari,
+    "birthday":        birthday,
 }

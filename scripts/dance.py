@@ -3,7 +3,7 @@
 Usage:
     uv run python scripts/dance.py [dance_name] [duration_seconds]
 
-Available dances: chromatic_drift  police  ambulance
+Available dances: chromatic_drift  police  ambulance  thunderstorm  bandari  birthday
 """
 
 import asyncio
