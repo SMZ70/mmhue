@@ -1,0 +1,546 @@
+"""Named light dances.
+
+Each dance is an async coroutine:  dance(bridge, light_ids, **kwargs) -> None
+
+The REGISTRY dict maps name → coroutine so any interface can list and invoke
+dances without knowing their internals.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import random
+from colorsys import hsv_to_rgb
+from dataclasses import dataclass
+from typing import Awaitable, Callable
+
+from aiohue.v2 import HueBridgeV2
+from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _hue_to_xy(hue_deg: float) -> tuple[float, float]:
+    """Full-saturation HSV hue → CIE xy (sRGB gamut)."""
+    r, g, b = hsv_to_rgb(hue_deg / 360.0, 1.0, 1.0)
+    X = r * 0.4124 + g * 0.3576 + b * 0.1805
+    Y = r * 0.2126 + g * 0.7152 + b * 0.0722
+    Z = r * 0.0193 + g * 0.1192 + b * 0.9505
+    total = X + Y + Z or 1.0
+    return X / total, Y / total
+
+
+_WHITE_XY = (0.3127, 0.3290)  # CIE D65 white point
+
+# A snapshot is a plain dict so it crosses any serialisation boundary easily.
+type Snapshot = dict
+
+
+async def _set(bridge: HueBridgeV2, lid: str, dead: set[str], **kwargs) -> None:
+    """set_state wrapper that silently marks unreachable lights and skips them."""
+    if lid in dead:
+        return
+    try:
+        await bridge.lights.set_state(lid, **kwargs)
+    except Exception as exc:
+        logger.warning("light {} unreachable, skipping for this dance: {}", lid[:8], exc)
+        dead.add(lid)
+
+
+async def _capture_state(bridge: HueBridgeV2, light_ids: list[str]) -> list[Snapshot]:
+    """Read and return the current state of each light."""
+    snaps: list[Snapshot] = []
+    for lid in light_ids:
+        light = bridge.lights.get(lid)
+        if light is None:
+            snaps.append({"id": lid, "found": False})
+            continue
+        snap: Snapshot = {"id": lid, "found": True,
+                          "on": light.is_on, "brightness": light.brightness}
+        # Determine active colour mode: CT wins if its value is currently valid
+        if light.color_temperature and light.color_temperature.mirek_valid:
+            snap["color_temp"] = light.color_temperature.mirek
+        elif light.color:
+            snap["color_xy"] = (light.color.xy.x, light.color.xy.y)
+        snaps.append(snap)
+    logger.debug("captured state for {} lights", len(snaps))
+    return snaps
+
+
+async def _restore_state(bridge: HueBridgeV2, snaps: list[Snapshot],
+                         transition_ms: int = 1500) -> None:
+    """Restore lights to a previously captured state. Skips unreachable lights."""
+    count = sum(1 for s in snaps if s.get("found"))
+    logger.info("restoring {} lights to pre-dance state…", count)
+    dead: set[str] = set()
+    for snap in snaps:
+        if not snap.get("found"):
+            continue
+        lid = snap["id"]
+        if not snap["on"]:
+            await _set(bridge, lid, dead, on=False, transition_time=transition_ms)
+            continue
+        kwargs: dict = {"on": True, "brightness": snap["brightness"],
+                        "transition_time": transition_ms}
+        if "color_temp" in snap:
+            kwargs["color_temp"] = snap["color_temp"]
+        elif "color_xy" in snap:
+            kwargs["color_xy"] = snap["color_xy"]
+        await _set(bridge, lid, dead, **kwargs)
+    logger.info("state restored")
+
+
+# ---------------------------------------------------------------------------
+# Dance 1 — Chromatic Drift
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _DriftCtx:
+    hue: float
+    hue_vel: float
+    bri_phase: float
+    bri_freq: float
+    burst_in: float
+
+
+def _rand_drift() -> _DriftCtx:
+    return _DriftCtx(
+        hue=random.uniform(0, 360),
+        hue_vel=random.uniform(20, 55) * random.choice([-1, 1]),
+        bri_phase=random.uniform(0, 2 * math.pi),
+        bri_freq=random.uniform(0.08, 0.22),
+        burst_in=random.uniform(6, 18),
+    )
+
+
+async def chromatic_drift(
+    bridge: HueBridgeV2,
+    light_ids: list[str],
+    *,
+    duration: float = 60.0,
+    fps: int = 3,
+    min_bri: float = 0.28,
+    max_bri: float = 0.92,
+) -> None:
+    """Each light independently drifts through the colour wheel.
+
+    Randomness: starting hue, drift speed/direction, brightness pulse rate
+    and phase, plus periodic bursts that jump to a new random hue.
+    """
+    saved = await _capture_state(bridge, light_ids)
+    try:
+        interval = 1.0 / fps
+        transition_ms = int(interval * 850)
+        state = {lid: _rand_drift() for lid in light_ids}
+        dead: set[str] = set()
+
+        for lid, ctx in state.items():
+            x, y = _hue_to_xy(ctx.hue)
+            await _set(bridge, lid, dead, on=True, color_xy=(x, y),
+                       brightness=70, transition_time=800)
+        await asyncio.sleep(0.9)
+
+        logger.info("chromatic_drift  {} lights  {:.0f}s", len(light_ids), duration)
+        elapsed = 0.0
+
+        while elapsed < duration:
+            t0 = asyncio.get_event_loop().time()
+            for lid, ctx in state.items():
+                if lid in dead:
+                    continue
+                ctx.hue = (ctx.hue + ctx.hue_vel * interval) % 360
+                ctx.burst_in -= interval
+                if ctx.burst_in <= 0:
+                    ctx.hue = random.uniform(0, 360)
+                    ctx.hue_vel = random.uniform(20, 55) * random.choice([-1, 1])
+                    ctx.burst_in = random.uniform(6, 20)
+                    logger.debug("burst → {} hue={:.0f}° vel={:+.0f}°/s",
+                                 lid[:8], ctx.hue, ctx.hue_vel)
+                bri_norm = 0.5 + 0.5 * math.sin(
+                    2 * math.pi * ctx.bri_freq * elapsed + ctx.bri_phase)
+                bri = (min_bri + (max_bri - min_bri) * bri_norm) * 100
+                x, y = _hue_to_xy(ctx.hue)
+                await _set(bridge, lid, dead, color_xy=(x, y),
+                           brightness=bri, transition_time=transition_ms)
+            elapsed += interval
+            await asyncio.sleep(max(0.0, interval - (asyncio.get_event_loop().time() - t0)))
+
+        logger.info("chromatic_drift finished")
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        await _restore_state(bridge, saved)
+
+
+# ---------------------------------------------------------------------------
+# Dance 2 — Emergency Flash  (police / ambulance)
+# ---------------------------------------------------------------------------
+
+async def emergency_flash(
+    bridge: HueBridgeV2,
+    light_ids: list[str],
+    *,
+    mode: str = "police",
+    duration: float = 30.0,
+    flash_hz: float = 3.0,
+) -> None:
+    """Hard alternating flashes.
+
+    police    — round-robin split into two groups, red vs blue, alternating.
+    ambulance — all lights alternate saturated red and cool white.
+    """
+    saved = await _capture_state(bridge, light_ids)
+    try:
+        half = 1.0 / (flash_hz * 2)
+        snap = max(30, int(half * 180))
+        dead: set[str] = set()
+
+        for lid in light_ids:
+            await _set(bridge, lid, dead, on=True, brightness=100, transition_time=100)
+        await asyncio.sleep(0.15)
+
+        elapsed = 0.0
+        phase = 0
+
+        if mode == "police":
+            group_a = light_ids[0::2]
+            group_b = light_ids[1::2] or light_ids
+            red, blue = _hue_to_xy(0), _hue_to_xy(240)
+            logger.info("emergency_flash  police  a={} b={}  {:.0f}s",
+                        len(group_a), len(group_b), duration)
+            while elapsed < duration:
+                t0 = asyncio.get_event_loop().time()
+                a_xy, a_bri = (red, 100) if phase % 2 == 0 else (blue, 85)
+                b_xy, b_bri = (blue, 85) if phase % 2 == 0 else (red, 100)
+                for lid in group_a:
+                    await _set(bridge, lid, dead, color_xy=a_xy, brightness=a_bri, transition_time=snap)
+                for lid in group_b:
+                    await _set(bridge, lid, dead, color_xy=b_xy, brightness=b_bri, transition_time=snap)
+                phase += 1
+                elapsed += half
+                await asyncio.sleep(max(0.0, half - (asyncio.get_event_loop().time() - t0)))
+
+        elif mode == "ambulance":
+            red, white = _hue_to_xy(0), _WHITE_XY
+            logger.info("emergency_flash  ambulance  {} lights  {:.0f}s",
+                        len(light_ids), duration)
+            while elapsed < duration:
+                t0 = asyncio.get_event_loop().time()
+                xy  = red if phase % 2 == 0 else white
+                bri = 100 if phase % 2 == 0 else 55
+                for lid in light_ids:
+                    await _set(bridge, lid, dead, color_xy=xy, brightness=bri, transition_time=snap)
+                phase += 1
+                elapsed += half
+                await asyncio.sleep(max(0.0, half - (asyncio.get_event_loop().time() - t0)))
+
+        logger.info("emergency_flash finished")
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        await _restore_state(bridge, saved)
+
+
+# ---------------------------------------------------------------------------
+# Dance 3 — Thunderstorm
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _StormCtx:
+    hue: float
+    hue_vel: float
+    bri: float
+    bri_phase: float
+    bri_freq: float
+    struck: bool
+
+
+async def thunderstorm(
+    bridge: HueBridgeV2,
+    light_ids: list[str],
+    *,
+    duration: float = 60.0,
+    fps: int = 2,
+) -> None:
+    """Dark indigo atmosphere with slow drift and random lightning strikes.
+
+    Lightning events run as separate asyncio tasks so the fast flash sequence
+    (bright white → flicker → fade back) doesn't block the drift loop.
+    """
+    saved = await _capture_state(bridge, light_ids)
+    pending: set[asyncio.Task] = set()
+
+    try:
+        interval = 1.0 / fps
+        transition_ms = int(interval * 800)
+
+        state: dict[str, _StormCtx] = {
+            lid: _StormCtx(
+                hue=random.uniform(210, 280),
+                hue_vel=random.uniform(2, 7) * random.choice([-1, 1]),
+                bri=random.uniform(18, 32),
+                bri_phase=random.uniform(0, 2 * math.pi),
+                bri_freq=random.uniform(0.04, 0.12),
+                struck=False,
+            )
+            for lid in light_ids
+        }
+        dead: set[str] = set()
+
+        for lid, ctx in state.items():
+            x, y = _hue_to_xy(ctx.hue)
+            await _set(bridge, lid, dead, on=True, color_xy=(x, y),
+                       brightness=int(ctx.bri), transition_time=1200)
+        await asyncio.sleep(1.4)
+
+        logger.info("thunderstorm  {} lights  {:.0f}s", len(light_ids), duration)
+
+        async def lightning_strike(targets: list[str]) -> None:
+            alive = [lid for lid in targets if lid not in dead]
+            for lid in alive:
+                state[lid].struck = True
+            try:
+                for lid in alive:
+                    await _set(bridge, lid, dead, color_xy=_WHITE_XY, brightness=100, transition_time=25)
+                await asyncio.sleep(0.07)
+                for lid in alive:
+                    await _set(bridge, lid, dead, brightness=30, transition_time=40)
+                await asyncio.sleep(0.05)
+                for lid in alive:
+                    await _set(bridge, lid, dead, brightness=90, transition_time=30)
+                await asyncio.sleep(0.09)
+                for lid in alive:
+                    ctx = state[lid]
+                    x, y = _hue_to_xy(ctx.hue)
+                    await _set(bridge, lid, dead, color_xy=(x, y),
+                               brightness=int(ctx.bri), transition_time=700)
+                await asyncio.sleep(0.75)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                for lid in alive:
+                    state[lid].struck = False
+
+        elapsed = 0.0
+        next_strike_at = random.uniform(2.0, 6.0)
+
+        while elapsed < duration:
+            t0 = asyncio.get_event_loop().time()
+
+            for lid, ctx in state.items():
+                if ctx.struck or lid in dead:
+                    continue
+                ctx.hue = (ctx.hue + ctx.hue_vel * interval) % 360
+                if ctx.hue < 200 or ctx.hue > 290:
+                    ctx.hue_vel *= -1
+                    ctx.hue = max(200.0, min(290.0, ctx.hue))
+                ctx.bri = 15 + 17 * (0.5 + 0.5 * math.sin(
+                    2 * math.pi * ctx.bri_freq * elapsed + ctx.bri_phase))
+                x, y = _hue_to_xy(ctx.hue)
+                await _set(bridge, lid, dead, color_xy=(x, y),
+                           brightness=int(ctx.bri), transition_time=transition_ms)
+
+            if elapsed >= next_strike_at:
+                free = [lid for lid in light_ids if not state[lid].struck]
+                if free:
+                    n = random.randint(1, min(3, len(free)))
+                    targets = random.sample(free, n)
+                    task = asyncio.create_task(lightning_strike(targets))
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
+                    logger.debug("lightning → {} lights", n)
+                next_strike_at = elapsed + random.uniform(3.0, 10.0)
+
+            elapsed += interval
+            await asyncio.sleep(max(0.0, interval - (asyncio.get_event_loop().time() - t0)))
+
+        logger.info("thunderstorm finished")
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        # Cancel any in-flight lightning tasks before restoring lights
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await _restore_state(bridge, saved)
+
+
+# ---------------------------------------------------------------------------
+# Dance 4 — Bandari  (Iranian Persian Gulf coastal dance)
+# ---------------------------------------------------------------------------
+
+async def bandari(
+    bridge: HueBridgeV2,
+    light_ids: list[str],
+    *,
+    duration: float = 60.0,
+    bpm: float = 118.0,
+) -> None:
+    """Warm rhythmic dance inspired by Iranian Bandari music.
+
+    Visual design:
+      - Colour zones: warm reds/golds (home), hot pink, teal, deep purple —
+        each light independently roams its zone then jumps to a new one
+      - Hard rhythmic shimmy at bpm, staggered across lights (ripple effect)
+      - Per-light random blackouts: a light snaps off for 0.5–1.5 beats
+      - Full-room blackout every ~16 beats — brief dramatic drop, then explosion
+      - Accent gold flash every 4 beats (the dohol downbeat)
+      - Rotating call light; energy builds over first 65% of duration
+    """
+    # Colour zones (hue lo, hue hi) — Persian-inspired palette
+    ZONES: list[tuple[float, float]] = [
+        (5,   55),   # warm: deep red → orange → gold  (home zone, 3× weight)
+        (5,   55),
+        (5,   55),
+        (315, 355),  # hot pink / magenta — Persian textiles
+        (168, 192),  # teal / turquoise  — Persian tilework
+        (265, 292),  # deep purple       — Persian carpets
+    ]
+
+    def _zone_hue(zone: int) -> float:
+        lo, hi = ZONES[zone]
+        return random.uniform(lo, hi)
+
+    saved = await _capture_state(bridge, light_ids)
+    try:
+        beat     = 60.0 / bpm   # ~0.508 s
+        fps      = 6
+        interval = 1.0 / fps    # ~167 ms
+        snap_ms  = 95
+
+        n = len(light_ids)
+        configs = [
+            {
+                "lid":          lid,
+                "hue":          _zone_hue(0),
+                "hue_vel":      random.uniform(18, 32) * random.choice([-1, 1]),
+                "shimmy_phase": (i / max(n - 1, 1)) * math.pi,  # 0 → π ripple spread
+                "zone":         0,
+                "next_zone_at": random.uniform(4, 10) * beat,
+                "dark_until":   -1.0,   # seconds; -1 = not dark
+            }
+            for i, lid in enumerate(light_ids)
+        ]
+
+        dead: set[str] = set()
+
+        # Prime lights
+        for cfg in configs:
+            x, y = _hue_to_xy(cfg["hue"])
+            await _set(bridge, cfg["lid"], dead, on=True, color_xy=(x, y),
+                       brightness=65, transition_time=1000)
+        await asyncio.sleep(1.1)
+
+        logger.info("bandari  {} lights  {:.0f}s  {:.0f}bpm", n, duration, bpm)
+
+        elapsed          = 0.0
+        prev_beat_num    = -1
+        call_light_idx   = 0
+        call_start_beat  = 0
+        blackout_until   = -1.0
+
+        while elapsed < duration:
+            t0 = asyncio.get_event_loop().time()
+
+            energy      = min(1.0, elapsed / (duration * 0.65))
+            beat_num    = int(elapsed / beat)
+            beat_phase  = (elapsed % beat) / beat * 2 * math.pi
+            is_new_beat = beat_num != prev_beat_num
+
+            if is_new_beat:
+                prev_beat_num = beat_num
+
+                if beat_num - call_start_beat >= 8:
+                    call_light_idx = (call_light_idx + 1) % n
+                    call_start_beat = beat_num
+
+                for i, cfg in enumerate(configs):
+                    if elapsed >= cfg["next_zone_at"]:
+                        cfg["zone"]        = random.randrange(len(ZONES))
+                        cfg["hue"]         = _zone_hue(cfg["zone"])
+                        cfg["hue_vel"]     = random.uniform(18, 32) * random.choice([-1, 1])
+                        cfg["next_zone_at"] = elapsed + random.uniform(3, 9) * beat
+                        logger.debug("zone jump  light {}  →  zone {}", i, cfg["zone"])
+
+                    if (i != call_light_idx
+                            and elapsed >= cfg["dark_until"]
+                            and random.random() < 0.20 * energy):
+                        cfg["dark_until"] = elapsed + beat * random.uniform(0.5, 1.5)
+
+                if beat_num > 0 and beat_num % 16 == 0 and energy > 0.35:
+                    blackout_until = elapsed + beat * random.uniform(0.4, 0.8)
+                    logger.debug("full blackout  beat {}", beat_num)
+
+            # ── Full-room blackout ────────────────────────────────────────────
+            if elapsed < blackout_until:
+                for cfg in configs:
+                    await _set(bridge, cfg["lid"], dead, brightness=3, transition_time=55)
+
+            # ── Accent flash: every 4 beats ───────────────────────────────────
+            elif is_new_beat and beat_num % 4 == 0:
+                gold_xy = _hue_to_xy(38)
+                for cfg in configs:
+                    cfg["dark_until"] = -1.0
+                    await _set(bridge, cfg["lid"], dead, color_xy=gold_xy,
+                               brightness=int(88 + 12 * energy), transition_time=snap_ms)
+
+            # ── Normal shimmy frame ───────────────────────────────────────────
+            else:
+                for i, cfg in enumerate(configs):
+                    if cfg["lid"] in dead:
+                        continue
+
+                    if elapsed < cfg["dark_until"]:
+                        await _set(bridge, cfg["lid"], dead, brightness=4, transition_time=snap_ms)
+                        continue
+
+                    lo, hi = ZONES[cfg["zone"]]
+                    cfg["hue"] = (cfg["hue"] + cfg["hue_vel"] * interval) % 360
+                    h = cfg["hue"]
+                    if not (lo <= h <= hi):
+                        cfg["hue_vel"] *= -1
+                        cfg["hue"] = max(lo, min(hi, h))
+
+                    shimmy_depth = 0.16 + 0.38 * energy
+                    shimmy_val   = 0.5 + 0.5 * math.cos(beat_phase - cfg["shimmy_phase"])
+                    base_bri     = 50 + 32 * energy
+                    bri          = base_bri * (1.0 - shimmy_depth * (1.0 - shimmy_val))
+
+                    if i == call_light_idx:
+                        bri = min(100, bri + 15 * energy * shimmy_val)
+
+                    x, y = _hue_to_xy(cfg["hue"])
+                    await _set(bridge, cfg["lid"], dead, color_xy=(x, y),
+                               brightness=max(5, bri), transition_time=snap_ms)
+
+            elapsed += interval
+            await asyncio.sleep(max(0.0, interval - (asyncio.get_event_loop().time() - t0)))
+
+        logger.info("bandari finished")
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        await _restore_state(bridge, saved)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+DanceFn = Callable[..., Awaitable[None]]
+
+REGISTRY: dict[str, DanceFn] = {
+    "chromatic_drift": chromatic_drift,
+    "police":          lambda b, ids, **kw: emergency_flash(b, ids, mode="police",    **kw),
+    "ambulance":       lambda b, ids, **kw: emergency_flash(b, ids, mode="ambulance", **kw),
+    "thunderstorm":    thunderstorm,
+    "bandari":         bandari,
+}

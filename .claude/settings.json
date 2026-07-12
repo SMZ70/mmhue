@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(uv run *)",
+      "Bash(docker image *)",
+      "Bash(pkill -f \"uv run\")"
+    ]
+  }
+}
