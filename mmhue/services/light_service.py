@@ -7,6 +7,7 @@ from aiohue.v2.models.resource import ResourceTypes
 from loguru import logger
 
 from mmhue.models import LightInfo, LightState, CommandResult
+from mmhue.services.bulk import set_lights_on
 
 
 class LightService:
@@ -98,12 +99,15 @@ class LightService:
         return CommandResult.ok("Color set")
 
     async def set_all_on(self, on: bool) -> CommandResult:
-        for light in self._bridge.lights:
-            if on:
-                await self._bridge.lights.turn_on(light.id)
-            else:
-                await self._bridge.lights.turn_off(light.id)
         state = "on" if on else "off"
+        ids = [light.id for light in self._bridge.lights]
+        stuck = await set_lights_on(self._bridge, ids, on)
+        if stuck:
+            logger.warning("{} of {} lights would not turn {}", len(stuck), len(ids), state)
+            return CommandResult.error(
+                f"{len(ids) - len(stuck)} of {len(ids)} lights {state} "
+                f"— {len(stuck)} would not respond"
+            )
         logger.info("All lights turned {}", state)
         return CommandResult.ok(f"All lights {state}")
 

@@ -4,6 +4,8 @@ from aiohue.v2 import HueBridgeV2
 from aiohue.v2.models.resource import ResourceTypes
 from loguru import logger
 
+from mmhue.services.bulk import set_lights_on
+
 from mmhue.models import RoomInfo, CommandResult
 
 
@@ -46,10 +48,11 @@ class RoomService:
         room = self.get_room(room_id)
         if not room:
             return CommandResult.error(f"Room not found")
-        for lid in room.light_ids:
-            if on:
-                await self._bridge.lights.turn_on(lid)
-            else:
-                await self._bridge.lights.turn_off(lid)
-        logger.info("Room {} → {}", room.name, "on" if on else "off")
-        return CommandResult.ok(f"{room.name} {'on' if on else 'off'}")
+        state = "on" if on else "off"
+        stuck = await set_lights_on(self._bridge, list(room.light_ids), on)
+        if stuck:
+            return CommandResult.error(
+                f"{room.name}: {len(stuck)} light(s) would not turn {state}"
+            )
+        logger.info("Room {} → {}", room.name, state)
+        return CommandResult.ok(f"{room.name} {state}")
