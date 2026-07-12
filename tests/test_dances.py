@@ -177,3 +177,64 @@ async def test_no_clean_state_turns_lights_off(tmp_path, monkeypatch):
     for lid in ids:
         last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
         assert last.kwargs["on"] is False
+
+
+async def test_stop_request_stops_a_dance_and_restores(tmp_path, monkeypatch):
+    """A stop written by ANY process (bot, web, cron) must stop the dance."""
+    from mmhue.services import dance_runner, dance_state
+
+    for attr, fn in [("STATE_DIR", tmp_path), ("DANCE_FILE", tmp_path / "dance.json"),
+                     ("HISTORY_FILE", tmp_path / "history.json"),
+                     ("LOCK_FILE", tmp_path / ".lock"), ("STOP_FILE", tmp_path / "stop.json")]:
+        monkeypatch.setattr(dance_state, attr, fn)
+    monkeypatch.setattr(dance_runner, "POLL_SECONDS", 0.1)
+
+    ids = ["l1", "l2"]
+    bridge = _make_bridge(ids)
+    dance_state.clear_stop()
+
+    task = asyncio.create_task(
+        dance_runner.run_dance(bridge, "birthday", ids, duration=3600.0)
+    )
+    await asyncio.sleep(1.0)
+    assert dance_state.running() == "birthday"
+
+    dance_state.request_stop()          # as the web UI / bot would
+    await asyncio.wait_for(task, timeout=15)
+
+    assert dance_state.running() is None          # state cleaned up
+    for lid in ids:                                # and the lights came back
+        last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
+        assert last.kwargs["brightness"] == 42.0
+
+
+def test_liveness_is_not_pid_based(tmp_path, monkeypatch):
+    """A live dance must survive being read from another PID namespace.
+
+    Regression: the web UI runs in a different container from the bot, so
+    os.kill(pid, 0) there saw the dance's pid as dead, pruned it, and wrote the
+    pruned list back -- silently deleting a running dance from shared state.
+    """
+    from mmhue.services import dance_state
+
+    for attr, val in [("STATE_DIR", tmp_path), ("DANCE_FILE", tmp_path / "dance.json"),
+                      ("LOCK_FILE", tmp_path / ".lock")]:
+        monkeypatch.setattr(dance_state, attr, val)
+
+    token = dance_state.begin("birthday", "cron")
+
+    # Rewrite the entry with a pid that exists in no namespace we can see
+    import json
+    entries = json.loads((tmp_path / "dance.json").read_text())
+    entries[0]["pid"] = 999999
+    (tmp_path / "dance.json").write_text(json.dumps(entries))
+
+    # A fresh heartbeat means alive, whatever the pid says
+    dance_state.heartbeat(token)
+    assert dance_state.running() == "birthday"
+
+    # ...but a dance that stops heartbeating is eventually reaped
+    entries = json.loads((tmp_path / "dance.json").read_text())
+    entries[0]["last_seen"] = 0
+    (tmp_path / "dance.json").write_text(json.dumps(entries))
+    assert dance_state.running() is None

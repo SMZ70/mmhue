@@ -5,11 +5,11 @@ WORKDIR /app
 
 # Cache-friendly: install deps before copying source
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project --extra web
 
 # Now install the project itself
 COPY mmhue/ ./mmhue/
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra web
 
 # ── Stage 2: minimal runtime ──────────────────────────────────────────────────
 FROM python:3.12-slim-bookworm

@@ -16,3 +16,23 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  web:
+    build: .
+    image: mmhue-bot:latest
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "mmhue.interfaces.web"]
+    env_file: .env
+    environment:
+      MMHUE_STATE_DIR: /app/state
+    # Same state dir as the bot: that is how a Stop here reaches a dance the
+    # bot (or cron) is running, and vice versa.
+    volumes:
+      - ./state:/app/state
+    ports:
+      - "8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

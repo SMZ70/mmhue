@@ -29,8 +29,13 @@ dev = [
     "mypy>=1.13",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["mmhue"]
+artifacts = ["mmhue/interfaces/web/static/*"]
+
 [project.scripts]
 mmhue-telegram = "mmhue.interfaces.telegram.__main__:main"
+mmhue-web = "mmhue.interfaces.web.__main__:main"
 
 [tool.ruff]
 target-version = "py312"

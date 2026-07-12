@@ -19,7 +19,8 @@ from contextlib import suppress
 from loguru import logger
 
 from mmhue.core import HueBridge
-from mmhue.services import ServiceHub
+from mmhue.services import ServiceHub, dance_state
+from mmhue.services.dance_runner import run_dance as run_stoppable_dance
 from mmhue.services.dances import REGISTRY
 
 
@@ -42,7 +43,11 @@ async def run_dance(name: str, duration: float, rooms: list[str]) -> int:
             return 1
 
         logger.info("running '{}' on {} lights for {:.0f}s", name, len(light_ids), duration)
-        task = asyncio.create_task(REGISTRY[name](b.raw, light_ids, duration=duration))
+        # A stale stop flag would kill the dance we are about to start
+        dance_state.clear_stop()
+        # run_dance also watches for stop requests from the bot or the web UI
+        task = asyncio.create_task(
+            run_stoppable_dance(b.raw, name, light_ids, duration=duration))
 
         # A scheduler or a "stop" command kills us with SIGTERM. Cancel the dance
         # rather than dying where we stand, so its cleanup restores the lights
