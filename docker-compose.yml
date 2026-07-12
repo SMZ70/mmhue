@@ -4,6 +4,13 @@ services:
     image: mmhue-bot:latest
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Shared dance state. Bind-mounted so the bot, the CLI (docker exec), and
+      # the host all read the same file. That is what lets the bot show a dance
+      # started by cron, and lets a dance tell that another one is already running.
+      MMHUE_STATE_DIR: /app/state
+    volumes:
+      - ./state:/app/state
     logging:
       driver: json-file
       options:

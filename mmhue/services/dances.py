@@ -18,6 +18,8 @@ from typing import Awaitable, Callable
 from aiohue.v2 import HueBridgeV2
 from loguru import logger
 
+from mmhue.services import dance_state
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -71,8 +73,16 @@ async def _set(bridge: HueBridgeV2, lid: str, dead: set[str], **kwargs) -> None:
         dead.add(lid)
 
 
-async def _capture_state(bridge: HueBridgeV2, light_ids: list[str]) -> list[Snapshot]:
-    """Read and return the current state of each light."""
+@dataclass
+class RestorePlan:
+    """What a dance should put the lights back to when it ends."""
+    light_ids: list[str]
+    snaps: list[Snapshot]   # empty => no trustworthy state; turn the lights off
+    token: str
+
+
+async def _read_lights(bridge: HueBridgeV2, light_ids: list[str]) -> list[Snapshot]:
+    """Read the current state of each light."""
     snaps: list[Snapshot] = []
     for lid in light_ids:
         light = bridge.lights.get(lid)
@@ -87,31 +97,83 @@ async def _capture_state(bridge: HueBridgeV2, light_ids: list[str]) -> list[Snap
         elif light.color:
             snap["color_xy"] = (light.color.xy.x, light.color.xy.y)
         snaps.append(snap)
-    logger.debug("captured state for {} lights", len(snaps))
     return snaps
 
 
-async def _restore_state(bridge: HueBridgeV2, snaps: list[Snapshot],
+async def record_clean_state(bridge: HueBridgeV2, light_ids: list[str]) -> None:
+    """Remember the current lights as a known-good, non-dance state.
+
+    Call this after an ordinary light change (a scene, a toggle, a dim). It is
+    what a dance later restores *to*, so a dance never has to guess.
+    """
+    if dance_state.running():
+        return  # mid-dance: the lights are strobing, this is not a clean state
+    snaps = await _read_lights(bridge, light_ids)
+    dance_state.record_clean(snaps)
+
+
+async def _capture_state(bridge: HueBridgeV2, light_ids: list[str],
+                         name: str = "dance", source: str = "lib") -> RestorePlan:
+    """Register the dance and work out what to restore to when it finishes.
+
+    If another dance is already running, whatever the lights are doing right now
+    is mid-strobe — snapshotting it would mean "restoring" the room to a random
+    confetti colour later. In that case fall back to the newest known non-dance
+    state, and if we have none, to darkness.
+    """
+    if dance_state.others_running():
+        target = dance_state.last_clean(light_ids)
+        if target:
+            logger.info("another dance is running; will restore to last clean state")
+        else:
+            logger.warning("another dance is running and no clean state known; "
+                           "will restore to lights-off")
+        token = dance_state.begin(name, source)
+        return RestorePlan(light_ids, target or [], token)
+
+    snaps = await _read_lights(bridge, light_ids)
+    dance_state.record_clean(snaps)
+    logger.debug("captured clean state for {} lights", len(snaps))
+    token = dance_state.begin(name, source)
+    return RestorePlan(light_ids, snaps, token)
+
+
+async def _restore_state(bridge: HueBridgeV2, plan: RestorePlan,
                          transition_ms: int = 1500) -> None:
-    """Restore lights to a previously captured state. Skips unreachable lights."""
-    count = sum(1 for s in snaps if s.get("found"))
-    logger.info("restoring {} lights to pre-dance state…", count)
+    """Put the lights back. Skips unreachable lights.
+
+    With no trustworthy state to return to, turn the lights off: darkness is a
+    sane, intentional-looking end state, whereas leaving them wherever the
+    strobe happened to stop is not.
+    """
     dead: set[str] = set()
-    for snap in snaps:
-        if not snap.get("found"):
-            continue
-        lid = snap["id"]
-        if not snap["on"]:
-            await _set(bridge, lid, dead, on=False, transition_time=transition_ms)
-            continue
-        kwargs: dict = {"on": True, "brightness": snap["brightness"],
-                        "transition_time": transition_ms}
-        if "color_temp" in snap:
-            kwargs["color_temp"] = snap["color_temp"]
-        elif "color_xy" in snap:
-            kwargs["color_xy"] = snap["color_xy"]
-        await _set(bridge, lid, dead, **kwargs)
-    logger.info("state restored")
+    try:
+        if not plan.snaps:
+            logger.warning("no clean state to restore; turning {} lights off",
+                           len(plan.light_ids))
+            for lid in plan.light_ids:
+                await _set(bridge, lid, dead, on=False, transition_time=transition_ms)
+            return
+
+        count = sum(1 for s in plan.snaps if s.get("found"))
+        logger.info("restoring {} lights to pre-dance state…", count)
+        for snap in plan.snaps:
+            if not snap.get("found"):
+                continue
+            lid = snap["id"]
+            if not snap["on"]:
+                await _set(bridge, lid, dead, on=False, transition_time=transition_ms)
+                continue
+            kwargs: dict = {"on": True, "brightness": snap["brightness"],
+                            "transition_time": transition_ms}
+            if "color_temp" in snap:
+                kwargs["color_temp"] = snap["color_temp"]
+            elif "color_xy" in snap:
+                kwargs["color_xy"] = snap["color_xy"]
+            await _set(bridge, lid, dead, **kwargs)
+        logger.info("state restored")
+    finally:
+        dance_state.end(plan.token)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +213,7 @@ async def chromatic_drift(
     Randomness: starting hue, drift speed/direction, brightness pulse rate
     and phase, plus periodic bursts that jump to a new random hue.
     """
-    saved = await _capture_state(bridge, light_ids)
+    saved = await _capture_state(bridge, light_ids, "chromatic_drift")
     try:
         interval = 1.0 / fps
         transition_ms = int(interval * 850)
@@ -214,7 +276,7 @@ async def emergency_flash(
     police    — round-robin split into two groups, red vs blue, alternating.
     ambulance — all lights alternate saturated red and cool white.
     """
-    saved = await _capture_state(bridge, light_ids)
+    saved = await _capture_state(bridge, light_ids, mode)
     try:
         half = 1.0 / (flash_hz * 2)
         snap = max(30, int(half * 180))
@@ -293,7 +355,7 @@ async def thunderstorm(
     Lightning events run as separate asyncio tasks so the fast flash sequence
     (bright white → flicker → fade back) doesn't block the drift loop.
     """
-    saved = await _capture_state(bridge, light_ids)
+    saved = await _capture_state(bridge, light_ids, "thunderstorm")
     pending: set[asyncio.Task] = set()
 
     try:
@@ -429,7 +491,7 @@ async def bandari(
         lo, hi = ZONES[zone]
         return random.uniform(lo, hi)
 
-    saved = await _capture_state(bridge, light_ids)
+    saved = await _capture_state(bridge, light_ids, "bandari")
     try:
         beat     = 60.0 / bpm   # ~0.508 s
         fps      = 6
@@ -594,7 +656,7 @@ async def birthday(
         logger.warning("birthday: no lights to dance with")
         return
 
-    saved = await _capture_state(bridge, light_ids)
+    saved = await _capture_state(bridge, light_ids, "birthday")
     dead: set[str] = set()
     n = len(light_ids)
     started = asyncio.get_event_loop().time()

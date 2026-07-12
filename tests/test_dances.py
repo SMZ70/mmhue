@@ -117,3 +117,63 @@ async def test_sigterm_restores_lights():
         last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
         assert last.kwargs["on"] is True
         assert last.kwargs["brightness"] == 42.0
+
+
+# ---------------------------------------------------------------------------
+# Shared dance state: never "restore" the room to a mid-strobe colour
+# ---------------------------------------------------------------------------
+
+async def test_second_dance_restores_to_clean_state_not_midstrobe(tmp_path, monkeypatch):
+    """A dance starting mid-party must not snapshot the strobe and restore to it."""
+    from mmhue.services import dance_state
+
+    monkeypatch.setattr(dance_state, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(dance_state, "DANCE_FILE", tmp_path / "dance.json")
+    monkeypatch.setattr(dance_state, "HISTORY_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(dance_state, "LOCK_FILE", tmp_path / ".lock")
+
+    ids = ["l1", "l2"]
+    bridge = _make_bridge(ids)
+
+    # The room as the user left it: warm, dim. This is the clean state.
+    dance_state.record_clean([
+        {"id": "l1", "found": True, "on": True, "brightness": 20.0, "color_temp": 400},
+        {"id": "l2", "found": True, "on": True, "brightness": 20.0, "color_temp": 400},
+    ])
+
+    # Dance A is already running (say, launched by cron)
+    dance_state.begin("birthday", "cron")
+
+    # The bridge now reports a garish mid-strobe state
+    for lid in ids:
+        bridge.lights.get(lid).brightness = 100.0
+
+    # Dance B starts and finishes
+    await birthday(bridge, ids, duration=5.0)
+
+    # It must restore the warm dim state, NOT brightness 100 from the strobe
+    for lid in ids:
+        last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
+        assert last.kwargs["brightness"] == 20.0
+        assert last.kwargs.get("color_temp") == 400
+
+
+async def test_no_clean_state_turns_lights_off(tmp_path, monkeypatch):
+    """With nothing safe to restore to, go dark rather than freeze mid-colour."""
+    from mmhue.services import dance_state
+
+    monkeypatch.setattr(dance_state, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(dance_state, "DANCE_FILE", tmp_path / "dance.json")
+    monkeypatch.setattr(dance_state, "HISTORY_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(dance_state, "LOCK_FILE", tmp_path / ".lock")
+
+    ids = ["l1", "l2"]
+    bridge = _make_bridge(ids)
+
+    dance_state.begin("birthday", "cron")   # another dance running, no history at all
+
+    await birthday(bridge, ids, duration=5.0)
+
+    for lid in ids:
+        last = [c for c in bridge.lights.set_state.await_args_list if c.args[0] == lid][-1]
+        assert last.kwargs["on"] is False

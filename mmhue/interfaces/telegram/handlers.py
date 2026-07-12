@@ -249,9 +249,11 @@ class _Handlers:
         # ── All on / off ──────────────────────────────────────────────────────
         if data == "all_on":
             await self.hub.lights.set_all_on(True)
+            await self._remember()
             return await self._refresh_home(query)
         if data == "all_off":
             await self.hub.lights.set_all_on(False)
+            await self._remember()
             return await self._refresh_home(query)
 
         action, _, rest = data.partition(":")
@@ -262,10 +264,12 @@ class _Handlers:
 
         if action == "room_on":
             await self.hub.rooms.set_on(rest, True)
+            await self._remember()
             return await self._show_room(query, rest)
 
         if action == "room_off":
             await self.hub.rooms.set_on(rest, False)
+            await self._remember()
             return await self._show_room(query, rest)
 
         if action == "room_scenes":
@@ -283,6 +287,7 @@ class _Handlers:
 
         if action == "scene_run":
             result = await self.hub.scenes.activate(rest)
+            await self._remember()
             await query.answer(result.message, show_alert=False)
             return
 
@@ -294,7 +299,13 @@ class _Handlers:
 
         if action == "dance_run":
             if self.hub.dances.running:
-                await self.hub.dances.stop()
+                result = await self.hub.dances.stop()
+                if not result.success:
+                    # Started elsewhere (cron/CLI) — we have no handle to cancel it
+                    await query.answer(result.message, show_alert=True)
+                    text, kb = _dances_view(self.hub.dances.running)
+                    await _edit(query, text, kb)
+                    return
             lights   = self.hub.lights.list_lights()
             light_ids = [l.id for l in lights]
             await self.hub.dances.start(rest, light_ids)
@@ -303,8 +314,10 @@ class _Handlers:
             return
 
         if data == "dance_stop":
-            await self.hub.dances.stop()
-            text, kb = _dances_view(None)
+            result = await self.hub.dances.stop()
+            if not result.success:
+                await query.answer(result.message, show_alert=True)
+            text, kb = _dances_view(self.hub.dances.running)
             await _edit(query, text, kb)
             return
 
@@ -318,6 +331,7 @@ class _Handlers:
 
         if action == "lt":
             await self.hub.lights.toggle(rest)
+            await self._remember()
             light = self.hub.lights.get_light(rest)
             if light:
                 text, kb = _light_view(light)
@@ -327,6 +341,7 @@ class _Handlers:
         if action == "lb":
             lid, _, bri_s = rest.partition(":")
             await self.hub.lights.set_brightness(lid, int(bri_s) / 100.0)
+            await self._remember()
             light = self.hub.lights.get_light(lid)
             if light:
                 text, kb = _light_view(light)
@@ -336,6 +351,7 @@ class _Handlers:
         if action == "lct":
             lid, _, mirek_s = rest.partition(":")
             await self.hub.lights.set_color_temp(lid, int(mirek_s))
+            await self._remember()
             light = self.hub.lights.get_light(lid)
             if light:
                 text, kb = _light_view(light)
@@ -345,6 +361,7 @@ class _Handlers:
         if action == "lc":
             lid, _, hue_s = rest.partition(":")
             await self.hub.lights.set_color(lid, float(hue_s))
+            await self._remember()
             light = self.hub.lights.get_light(lid)
             if light:
                 text, kb = _light_view(light)
@@ -352,6 +369,10 @@ class _Handlers:
             return
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    async def _remember(self) -> None:
+        """Record the lights as a clean, non-dance state (no-op mid-dance)."""
+        await self.hub.dances.remember_state([l.id for l in self.hub.lights.list_lights()])
 
     async def _refresh_home(self, query) -> None:
         rooms  = self.hub.rooms.list_rooms()
