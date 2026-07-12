@@ -1,7 +1,10 @@
-"""Run a named dance on the TV light and all kitchen lights.
+"""Run a named dance on the lights of one or more rooms.
 
 Usage:
-    uv run python scripts/dance.py [dance_name] [duration_seconds]
+    uv run python scripts/dance.py [dance_name] [duration_seconds] [room ...]
+
+Rooms are matched case-insensitively against the room names on your bridge,
+and default to every room the bridge knows about.
 
 Available dances: chromatic_drift  police  ambulance  thunderstorm  bandari  birthday
 """
@@ -30,20 +33,21 @@ async def find_lights(bridge, room_names: list[str]) -> dict[str, list[str]]:
     for group in bridge.groups:
         if group.type != ResourceTypes.ROOM:
             continue
-        for target in room_names:
-            if target.lower() not in group.metadata.name.lower():
-                continue
-            ids = []
-            for child in group.children:
-                dev = dev_by_id.get(child.rid)
-                if dev and dev.id in light_id_by_dev:
-                    ids.append(light_id_by_dev[dev.id])
-            if ids:
-                result[group.metadata.name] = ids
+        name = group.metadata.name
+        # No names given → every room on the bridge
+        if room_names and not any(t.lower() in name.lower() for t in room_names):
+            continue
+        ids = []
+        for child in group.children:
+            dev = dev_by_id.get(child.rid)
+            if dev and dev.id in light_id_by_dev:
+                ids.append(light_id_by_dev[dev.id])
+        if ids:
+            result[name] = ids
     return result
 
 
-async def main(dance_name: str, duration: float) -> None:
+async def main(dance_name: str, duration: float, room_names: list[str]) -> None:
     dance_fn = REGISTRY.get(dance_name)
     if not dance_fn:
         logger.error("Unknown dance '{}'. Available: {}", dance_name, ", ".join(REGISTRY))
@@ -52,7 +56,7 @@ async def main(dance_name: str, duration: float) -> None:
     bridge = HueBridge()
     async with bridge.connected() as b:
         raw = b.raw
-        rooms = await find_lights(raw, ["Living room", "Kitchen"])
+        rooms = await find_lights(raw, room_names)
         if not rooms:
             logger.error("No matching lights found")
             return
@@ -75,7 +79,8 @@ async def main(dance_name: str, duration: float) -> None:
 if __name__ == "__main__":
     name     = sys.argv[1] if len(sys.argv) > 1 else "chromatic_drift"
     duration = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
+    rooms    = sys.argv[3:]  # empty → all rooms
     try:
-        asyncio.run(main(name, duration))
+        asyncio.run(main(name, duration, rooms))
     except KeyboardInterrupt:
         pass
