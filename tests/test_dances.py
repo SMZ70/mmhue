@@ -74,3 +74,28 @@ async def test_birthday_with_no_lights_is_a_noop():
     bridge = _make_bridge([])
     await birthday(bridge, [], duration=5.0)
     bridge.lights.set_state.assert_not_awaited()
+
+
+async def test_white_only_light_still_dances():
+    """A bulb that rejects colour must keep getting brightness, not be dropped."""
+    from mmhue.services import dances
+
+    ids = ["colour", "white"]
+    bridge = _make_bridge(ids)
+    dances._MONO.discard("white")
+
+    async def set_state(lid, **kwargs):
+        if lid == "white" and "color_xy" in kwargs:
+            raise Exception("attribute (.color.xy) is not supported by resource white")
+
+    bridge.lights.set_state = AsyncMock(side_effect=set_state)
+
+    await birthday(bridge, ids, duration=6.0)
+
+    calls = bridge.lights.set_state.await_args_list
+    white = [c for c in calls if c.args[0] == "white"]
+
+    # It kept being driven all the way through, on brightness alone
+    assert len(white) > 5
+    assert all("color_xy" not in c.kwargs for c in white[-3:])
+    assert any("brightness" in c.kwargs for c in white)
