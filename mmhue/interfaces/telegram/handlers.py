@@ -306,8 +306,7 @@ class _Handlers:
                     text, kb = _dances_view(self.hub.dances.running)
                     await _edit(query, text, kb)
                     return
-            lights   = self.hub.lights.list_lights()
-            light_ids = [l.id for l in lights]
+            light_ids = [l.id for l in self.hub.lights.danceable_lights()]
             await self.hub.dances.start(rest, light_ids)
             text, kb = _dances_view(self.hub.dances.running)
             await _edit(query, text, kb)

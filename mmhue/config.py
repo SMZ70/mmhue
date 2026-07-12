@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_allowed_user_ids: list[int] = []
 
+    # Rooms that should never take part in a dance — a strobing hallway at
+    # midnight helps nobody. Matched case-insensitively, as a substring.
+    dance_exclude_rooms: list[str] = []
+
     # General
     log_level: str = "INFO"
 

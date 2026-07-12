@@ -29,7 +29,7 @@ async def run_dance(name: str, duration: float, rooms: list[str]) -> int:
     async with bridge.connected() as b:
         hub = ServiceHub(b.raw)
 
-        lights = hub.lights.list_lights()
+        lights = hub.lights.danceable_lights()
         if rooms:
             wanted = [r.lower() for r in rooms]
             lights = [

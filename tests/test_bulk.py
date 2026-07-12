@@ -70,3 +70,43 @@ async def test_one_broken_light_does_not_strand_the_others():
     assert stuck == ["broken"]                        # reported, not hidden
     assert bridge.lights.get("a").is_on is False      # and the rest still switched
     assert bridge.lights.get("c").is_on is False
+
+
+# ---------------------------------------------------------------------------
+# Excluded rooms never dance
+# ---------------------------------------------------------------------------
+
+def _light(lid: str, room: str) -> MagicMock:
+    light = MagicMock()
+    light.id, light.room = lid, room
+    return light
+
+
+def test_excluded_rooms_are_kept_out_of_dances(monkeypatch):
+    """A strobing hallway at midnight is a hazard, not a party."""
+    from mmhue.config import settings
+    from mmhue.services.light_service import LightService
+
+    monkeypatch.setattr(settings, "dance_exclude_rooms", ["Hallway"])
+
+    svc = LightService(MagicMock())
+    monkeypatch.setattr(svc, "list_lights", lambda: [
+        _light("l1", "Living room"),
+        _light("l2", "Kitchen"),
+        _light("l3", "Hallway"),      # must sit the dance out
+        _light("l4", None),           # no room: still allowed
+    ])
+
+    ids = [x.id for x in svc.danceable_lights()]
+    assert ids == ["l1", "l2", "l4"]
+    assert [x.id for x in svc.list_lights()] == ["l1", "l2", "l3", "l4"]  # still controllable
+
+
+def test_no_exclusions_means_every_light_dances(monkeypatch):
+    from mmhue.config import settings
+    from mmhue.services.light_service import LightService
+
+    monkeypatch.setattr(settings, "dance_exclude_rooms", [])
+    svc = LightService(MagicMock())
+    monkeypatch.setattr(svc, "list_lights", lambda: [_light("l1", "Hallway")])
+    assert [x.id for x in svc.danceable_lights()] == ["l1"]

@@ -6,6 +6,7 @@ from aiohue.v2 import HueBridgeV2
 from aiohue.v2.models.resource import ResourceTypes
 from loguru import logger
 
+from mmhue.config import settings
 from mmhue.models import LightInfo, LightState, CommandResult
 from mmhue.services.bulk import set_lights_on
 
@@ -40,6 +41,26 @@ class LightService:
                     supports_color_temp=light.supports_color_temperature,
                 )
             )
+        return lights
+
+    def danceable_lights(self) -> list[LightInfo]:
+        """Lights a dance may use — every light except the excluded rooms.
+
+        Some rooms should never join in: a hallway strobing at midnight is not a
+        party, it is a hazard. Configured with DANCE_EXCLUDE_ROOMS, and applied
+        here so every interface (bot, web, CLI, cron) honours it.
+        """
+        excluded = [r.strip().lower() for r in settings.dance_exclude_rooms if r.strip()]
+        if not excluded:
+            return self.list_lights()
+
+        lights = [
+            light for light in self.list_lights()
+            if not (light.room and any(x in light.room.lower() for x in excluded))
+        ]
+        skipped = len(self.list_lights()) - len(lights)
+        if skipped:
+            logger.debug("dance skips {} light(s) in excluded rooms {}", skipped, excluded)
         return lights
 
     def get_light(self, light_id: str) -> LightInfo | None:

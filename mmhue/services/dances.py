@@ -456,155 +456,229 @@ async def thunderstorm(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Dance 4 — Bandari  (Iranian Persian Gulf coastal dance)
 # ---------------------------------------------------------------------------
+
+_BANDARI_ZONES: list[tuple[float, float]] = [
+    (8, 40),      # deep red -> orange -> gold  (home)
+    (318, 350),   # hot pink / magenta
+    (168, 195),   # teal / turquoise
+    (265, 295),   # deep purple
+    (95, 130),    # lime
+]
+
+_DOHOL_GOLD = 38.0
+
+# Measured off a real bandari track (Sasy, "Bandari"): a hit every ~163 ms,
+# i.e. a 6/8 bar of ~0.98 s.
+_BANDARI_PULSE = 0.163
+_BANDARI_BED = 22.0       # the room glows between strikes; it never goes black
+
+
+async def _gset(bridge: HueBridgeV2, gid: str, dead: set[str], **kwargs) -> None:
+    """Drive a whole ROOM with one command.
+
+    This is the difference between a light show and a disco. Striking six lights
+    individually costs six commands, and releasing them six more — the entire
+    budget the bridge will accept in a second. One grouped_light command hits
+    every light in the room at once, so the room can slam in unison on the beat,
+    which is the thing that actually makes people move.
+    """
+    if gid in dead:
+        return
+    try:
+        await bridge.groups.grouped_light.set_state(gid, **kwargs)
+    except Exception as exc:
+        logger.warning("room {} unreachable: {}", gid[:8], exc)
+        dead.add(gid)
+
+
+def _dance_rooms(bridge: HueBridgeV2, light_ids: list[str]) -> list[str]:
+    """grouped_light ids for the rooms we are allowed to dance in."""
+    allowed = set(light_ids)
+    rooms: list[str] = []
+    for gl in bridge.groups.grouped_light:
+        members = {light.id for light in bridge.groups.grouped_light.get_lights(gl.id)}
+        if members and members <= allowed:
+            rooms.append(gl.id)
+    return rooms
+
 
 async def bandari(
     bridge: HueBridgeV2,
     light_ids: list[str],
     *,
     duration: float = 60.0,
-    bpm: float = 118.0,
+    pulse: float = _BANDARI_PULSE,
 ) -> None:
-    """Warm rhythmic dance inspired by Iranian Bandari music.
+    """A 6/8 bandari built out of sections, so it goes somewhere.
 
-    Visual design:
-      - Colour zones: warm reds/golds (home), hot pink, teal, deep purple —
-        each light independently roams its zone then jumps to a new one
-      - Hard rhythmic shimmy at bpm, staggered across lights (ripple effect)
-      - Per-light random blackouts: a light snaps off for 0.5–1.5 beats
-      - Full-room blackout every ~16 beats — brief dramatic drop, then explosion
-      - Accent gold flash every 4 beats (the dohol downbeat)
-      - Rotating call light; energy builds over first 65% of duration
+    Two things were wrong before. It looped a single bar for a minute, which is
+    monotonous however correct the rhythm is; and every strike hit one lonely
+    light, because striking the whole room individually costs more commands than
+    the bridge will take. Rooms are driven as groups now — one command each — so
+    the house can slam together on the dohol.
+
+    Sections are shuffled and played 3-5 bars at a time, the way the birthday
+    dance moves between acts:
+
+      dohol   — the whole house slams gold in unison on 1 and 4. The hook.
+      chase   — rooms fire one after another: a wave running around the flat.
+      shimmy  — individual lights, quick teks scattered over the beat
+      call    — one room calls, the others answer
+
+    Every 6/8 bar is ~0.98 s, so a section is a few seconds — long enough to
+    lock into, short enough that it never gets boring.
     """
-    # Colour zones (hue lo, hue hi) — Persian-inspired palette
-    ZONES: list[tuple[float, float]] = [
-        (5,   55),   # warm: deep red → orange → gold  (home zone, 3× weight)
-        (5,   55),
-        (5,   55),
-        (315, 355),  # hot pink / magenta — Persian textiles
-        (168, 192),  # teal / turquoise  — Persian tilework
-        (265, 292),  # deep purple       — Persian carpets
-    ]
-
-    def _zone_hue(zone: int) -> float:
-        lo, hi = ZONES[zone]
-        return random.uniform(lo, hi)
+    if not light_ids:
+        return
 
     saved = await _capture_state(bridge, light_ids, "bandari")
     try:
-        beat     = 60.0 / bpm   # ~0.508 s
-        fps      = 6
-        interval = 1.0 / fps    # ~167 ms
-        snap_ms  = 95
-
-        n = len(light_ids)
-        configs = [
-            {
-                "lid":          lid,
-                "hue":          _zone_hue(0),
-                "hue_vel":      random.uniform(18, 32) * random.choice([-1, 1]),
-                "shimmy_phase": (i / max(n - 1, 1)) * math.pi,  # 0 → π ripple spread
-                "zone":         0,
-                "next_zone_at": random.uniform(4, 10) * beat,
-                "dark_until":   -1.0,   # seconds; -1 = not dark
-            }
-            for i, lid in enumerate(light_ids)
-        ]
-
         dead: set[str] = set()
+        rooms = _dance_rooms(bridge, light_ids)
+        n = len(light_ids)
 
-        # Prime lights
-        for cfg in configs:
-            x, y = _hue_to_xy(cfg["hue"])
-            await _set(bridge, cfg["lid"], dead, on=True, color_xy=(x, y),
-                       brightness=65, transition_time=1000)
-        await asyncio.sleep(1.1)
+        # Fall back to per-light strikes if the bridge exposes no usable rooms
+        use_rooms = len(rooms) >= 2
 
-        logger.info("bandari  {} lights  {:.0f}s  {:.0f}bpm", n, duration, bpm)
+        for lid in light_ids:
+            await _set(bridge, lid, dead, on=True, brightness=_BANDARI_BED,
+                       color_xy=_hue_to_xy(random.uniform(*_BANDARI_ZONES[0])),
+                       transition_time=400)
+        await asyncio.sleep(0.6)
 
-        elapsed          = 0.0
-        prev_beat_num    = -1
-        call_light_idx   = 0
-        call_start_beat  = 0
-        blackout_until   = -1.0
+        logger.info("bandari  {} lights in {} rooms  {:.0f}s  6/8 @ {:.0f}ms",
+                    n, len(rooms), duration, pulse * 1000)
+
+        order = light_ids[:]
+        random.shuffle(order)
+        idx = 0
+        zone = 0
+
+        started = asyncio.get_event_loop().time()
+        elapsed = 0.0
+
+        def over() -> bool:
+            """Sections run whole bars, so check the clock between them; without
+            this a 30s dance could keep going for another five."""
+            return asyncio.get_event_loop().time() - started >= duration
+
+        def gold() -> tuple[float, float]:
+            return _hue_to_xy(_DOHOL_GOLD + random.uniform(-7, 7))
+
+        def colour() -> tuple[float, float]:
+            return _hue_to_xy(random.uniform(*_BANDARI_ZONES[zone]))
+
+        async def beat(ops, swing: float = 1.0) -> None:
+            """Run one pulse worth of commands, then wait out the pulse."""
+            t0 = asyncio.get_event_loop().time()
+            for fn in ops:
+                await fn()
+            wait = pulse * swing
+            await asyncio.sleep(max(0.0, wait - (asyncio.get_event_loop().time() - t0)))
+
+        # ── Sections ─────────────────────────────────────────────────────────
+
+        async def dohol(bars: int) -> None:
+            """The hook: the whole house hits together on 1 and 4."""
+            for _ in range(bars):
+                if over():
+                    return
+                g = gold()
+                await beat([lambda r=r, c=g: _gset(bridge, r, dead, color_xy=c, brightness=100,
+                                                    transition_time=50) for r in rooms])
+                await beat([lambda r=r: _gset(bridge, r, dead, brightness=_BANDARI_BED,
+                                              transition_time=90) for r in rooms], 0.94)
+                await beat([])                                        # 3 — space
+                half = rooms[: max(1, len(rooms) - 1)]
+                g2 = gold()
+                await beat([lambda r=r, c=g2: _gset(bridge, r, dead, color_xy=c, brightness=90,
+                                                     transition_time=50) for r in half])
+                await beat([lambda r=r: _gset(bridge, r, dead, brightness=_BANDARI_BED,
+                                              transition_time=90) for r in half], 0.94)
+                await beat([])                                        # 6 — space
+
+        async def chase(bars: int) -> None:
+            """A wave running around the flat, room to room."""
+            i = 0
+            for _ in range(bars):
+                if over():
+                    return
+                for hit in (True, False, True, True, False, True):
+                    if not hit:
+                        await beat([], 0.94)
+                        continue
+                    cur, prev = rooms[i % len(rooms)], rooms[(i - 1) % len(rooms)]
+                    c = colour()
+                    await beat([
+                        lambda r=cur, x=c: _gset(bridge, r, dead, color_xy=x, brightness=95,
+                                                 transition_time=50),
+                        lambda r=prev: _gset(bridge, r, dead, brightness=_BANDARI_BED,
+                                             transition_time=110),
+                    ], 1.04)
+                    i += 1
+
+        async def shimmy(bars: int) -> None:
+            """Individual lights: quick teks scattered across the beat."""
+            nonlocal idx
+            lit: list[str] = []
+            for _ in range(bars):
+                if over():
+                    return
+                for count, bri in ((2, 100.0), (0, 0.0), (1, 78.0),
+                                   (1, 95.0), (0, 0.0), (1, 88.0)):
+                    ops = [lambda x=x: _set(bridge, x, dead, brightness=_BANDARI_BED,
+                                            transition_time=110) for x in lit]
+                    lit = []
+                    for _k in range(count):
+                        lid = order[idx % n]
+                        idx += 1
+                        xy = gold() if bri >= 95 else colour()
+                        ops.append(lambda x=lid, c=xy, b=bri:
+                                   _set(bridge, x, dead, color_xy=c, brightness=b,
+                                        transition_time=50))
+                        lit.append(lid)
+                    await beat(ops, 1.0 if count else 0.94)
+
+        async def call(bars: int) -> None:
+            """One room calls; the others answer."""
+            for b in range(bars):
+                if over():
+                    return
+                lead = rooms[b % len(rooms)]
+                rest = [r for r in rooms if r != lead]
+                g = gold()
+                await beat([lambda r=lead, c=g: _gset(bridge, r, dead, color_xy=c,
+                                                      brightness=100, transition_time=50)])
+                await beat([lambda r=lead: _gset(bridge, r, dead, brightness=_BANDARI_BED,
+                                                 transition_time=90)], 0.94)
+                c = colour()
+                await beat([lambda r=r, x=c: _gset(bridge, r, dead, color_xy=x, brightness=92,
+                                                   transition_time=50) for r in rest], 1.06)
+                await beat([lambda r=r: _gset(bridge, r, dead, brightness=_BANDARI_BED,
+                                              transition_time=90) for r in rest])
+                await beat([], 0.94)
+                c2 = colour()
+                await beat([lambda r=r, x=c2: _gset(bridge, r, dead, color_xy=x, brightness=96,
+                                                    transition_time=50) for r in rooms], 1.06)
+
+        sections = [dohol, chase, call, shimmy] if use_rooms else [shimmy]
+        bag: list = []
 
         while elapsed < duration:
-            t0 = asyncio.get_event_loop().time()
-
-            energy      = min(1.0, elapsed / (duration * 0.65))
-            beat_num    = int(elapsed / beat)
-            beat_phase  = (elapsed % beat) / beat * 2 * math.pi
-            is_new_beat = beat_num != prev_beat_num
-
-            if is_new_beat:
-                prev_beat_num = beat_num
-
-                if beat_num - call_start_beat >= 8:
-                    call_light_idx = (call_light_idx + 1) % n
-                    call_start_beat = beat_num
-
-                for i, cfg in enumerate(configs):
-                    if elapsed >= cfg["next_zone_at"]:
-                        cfg["zone"]        = random.randrange(len(ZONES))
-                        cfg["hue"]         = _zone_hue(cfg["zone"])
-                        cfg["hue_vel"]     = random.uniform(18, 32) * random.choice([-1, 1])
-                        cfg["next_zone_at"] = elapsed + random.uniform(3, 9) * beat
-                        logger.debug("zone jump  light {}  →  zone {}", i, cfg["zone"])
-
-                    if (i != call_light_idx
-                            and elapsed >= cfg["dark_until"]
-                            and random.random() < 0.20 * energy):
-                        cfg["dark_until"] = elapsed + beat * random.uniform(0.5, 1.5)
-
-                if beat_num > 0 and beat_num % 16 == 0 and energy > 0.35:
-                    blackout_until = elapsed + beat * random.uniform(0.4, 0.8)
-                    logger.debug("full blackout  beat {}", beat_num)
-
-            # ── Full-room blackout ────────────────────────────────────────────
-            if elapsed < blackout_until:
-                for cfg in configs:
-                    await _set(bridge, cfg["lid"], dead, brightness=3, transition_time=55)
-
-            # ── Accent flash: every 4 beats ───────────────────────────────────
-            elif is_new_beat and beat_num % 4 == 0:
-                gold_xy = _hue_to_xy(38)
-                for cfg in configs:
-                    cfg["dark_until"] = -1.0
-                    await _set(bridge, cfg["lid"], dead, color_xy=gold_xy,
-                               brightness=int(88 + 12 * energy), transition_time=snap_ms)
-
-            # ── Normal shimmy frame ───────────────────────────────────────────
-            else:
-                for i, cfg in enumerate(configs):
-                    if cfg["lid"] in dead:
-                        continue
-
-                    if elapsed < cfg["dark_until"]:
-                        await _set(bridge, cfg["lid"], dead, brightness=4, transition_time=snap_ms)
-                        continue
-
-                    lo, hi = ZONES[cfg["zone"]]
-                    cfg["hue"] = (cfg["hue"] + cfg["hue_vel"] * interval) % 360
-                    h = cfg["hue"]
-                    if not (lo <= h <= hi):
-                        cfg["hue_vel"] *= -1
-                        cfg["hue"] = max(lo, min(hi, h))
-
-                    shimmy_depth = 0.16 + 0.38 * energy
-                    shimmy_val   = 0.5 + 0.5 * math.cos(beat_phase - cfg["shimmy_phase"])
-                    base_bri     = 50 + 32 * energy
-                    bri          = base_bri * (1.0 - shimmy_depth * (1.0 - shimmy_val))
-
-                    if i == call_light_idx:
-                        bri = min(100, bri + 15 * energy * shimmy_val)
-
-                    x, y = _hue_to_xy(cfg["hue"])
-                    await _set(bridge, cfg["lid"], dead, color_xy=(x, y),
-                               brightness=max(5, bri), transition_time=snap_ms)
-
-            elapsed += interval
-            await asyncio.sleep(max(0.0, interval - (asyncio.get_event_loop().time() - t0)))
+            if not bag:
+                bag = sections.copy()
+                random.shuffle(bag)
+            section = bag.pop()
+            zone = random.randrange(len(_BANDARI_ZONES))
+            bars = random.randint(3, 5)
+            logger.debug("bandari → {} for {} bars", section.__name__, bars)
+            await section(bars)
+            elapsed = asyncio.get_event_loop().time() - started
 
         logger.info("bandari finished")
 
@@ -614,7 +688,6 @@ async def bandari(
         await _restore_state(bridge, saved)
 
 
-# ---------------------------------------------------------------------------
 # Dance 5 — Birthday  (candles → wish → blow-out → confetti party)
 # ---------------------------------------------------------------------------
 

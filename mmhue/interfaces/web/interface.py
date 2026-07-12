@@ -151,7 +151,7 @@ class WebInterface(BaseInterface):
 
         @app.post("/api/dances/{name}/start")
         async def dance_start(name: str, _: None = Depends(auth)) -> dict:
-            ids = [light.id for light in hub.lights.list_lights()]
+            ids = [light.id for light in hub.lights.danceable_lights()]
             result = await hub.dances.start(name, ids)
             return {"ok": result.success, "message": result.message}
 

@@ -238,3 +238,45 @@ def test_liveness_is_not_pid_based(tmp_path, monkeypatch):
     entries[0]["last_seen"] = 0
     (tmp_path / "dance.json").write_text(json.dumps(entries))
     assert dance_state.running() is None
+
+
+# ---------------------------------------------------------------------------
+# Bandari: fast because it fits the bridge's budget, not despite it
+# ---------------------------------------------------------------------------
+
+async def test_bandari_stays_within_the_bridge_command_budget():
+    """The old bandari fired ~42 commands/sec at a bridge that serves ~10, so it
+    crawled. It must now spend roughly one stroke's worth of commands per beat."""
+    from mmhue.services.dances import bandari
+
+    ids = ["l1", "l2", "l3", "l4", "l5", "l6", "l7"]
+    bridge = _make_bridge(ids)
+
+    import time
+    t0 = time.monotonic()
+    await bandari(bridge, ids, duration=8.0)
+    ran_for = time.monotonic() - t0
+
+    # Sections run whole bars, so measure against the real runtime — and check
+    # the dance does not wildly overrun the duration it was asked for.
+    assert ran_for < 8.0 + 2.0, f"overran its duration by {ran_for - 8.0:.1f}s"
+
+    # Ignore the priming burst and the final restore; count the loop itself
+    calls = len(bridge.lights.set_state.await_args_list) - 2 * len(ids)
+    rate = calls / ran_for
+
+    assert rate <= 12.0, f"{rate:.1f} commands/sec would be throttled by the bridge"
+    assert rate >= 5.0, f"{rate:.1f} commands/sec is too sleepy for bandari"
+
+
+async def test_bandari_keeps_the_room_moving():
+    """Something must change every ~230ms, and every light gets played."""
+    from mmhue.services.dances import bandari
+
+    ids = ["l1", "l2", "l3", "l4", "l5"]
+    bridge = _make_bridge(ids)
+
+    await bandari(bridge, ids, duration=10.0)
+
+    touched = {c.args[0] for c in bridge.lights.set_state.await_args_list}
+    assert touched == set(ids)          # no light sits the whole song out
