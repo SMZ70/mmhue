@@ -1,4 +1,8 @@
-# mmhue
+<p align="center">
+  <img src="docs/logo.svg" width="120" alt="mmhue logo">
+</p>
+
+<h1 align="center">mmhue</h1>
 
 A modular Philips Hue controller with pluggable interfaces. Drive your lights
 from Telegram (inline keyboard, 3-level Home → Room → Light navigation), from a
